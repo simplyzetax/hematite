@@ -1,0 +1,19 @@
+README.md
+  s_8708ec28af4d51::t_e881f52d2f9d42 1,7,157
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ea496462ae675cad8e8c9bb803654b5c478712d2",
+  "prompts": {},
+  "sessions": {
+    "s_8708ec28af4d51": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "554de355-71fe-4150-b00d-3deb4c84d609",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Finn <ernzerhofffinn@icloud.com>"
+    }
+  }
+}
