@@ -1,10 +1,10 @@
-![Hematite](docs/header.png)
+![Hematite](https://raw.githubusercontent.com/simplyzetax/hematite/main/docs/header.png)
 
 **Faster world generation for Paper. Same world, block for block.**
 
 Hematite swaps Minecraft's terrain generator for one written in Rust. It builds exactly the blocks vanilla would, just much faster, and it generates the land fast players are heading into before they get there. Elytra and trident flights stop running into the edge of the world.
 
-![Flying over freshly generated terrain](docs/demo.gif)
+![Flying over freshly generated terrain](https://raw.githubusercontent.com/simplyzetax/hematite/main/docs/demo.gif)
 
 ## Why Hematite
 
@@ -154,4 +154,4 @@ These need a JDK and the 26.3 install from the Modrinth app. The other files in 
 
 ## License
 
-MIT, see [LICENSE](LICENSE). The Distant Horizons database scripts in `data/dh_sql` are LGPL-3.0, see [their notice](data/dh_sql/NOTICE).
+MIT, see [LICENSE](https://github.com/simplyzetax/hematite/blob/main/LICENSE). The Distant Horizons database scripts in `data/dh_sql` are LGPL-3.0, see [their notice](https://github.com/simplyzetax/hematite/blob/main/data/dh_sql/NOTICE).
