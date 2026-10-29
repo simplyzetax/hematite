@@ -3,7 +3,7 @@ version: 0.1.0
 main: dev.hematite.HematitePlugin
 api-version: '26.3'
 load: STARTUP
-description: Generates terrain (noise, surface, caves) in Rust; vanilla does the rest.
+description: Faster world generation, block for block identical to vanilla. Terrain and biomes in Rust, faster ore veins, look-ahead for fast flyers.
 commands:
   hematite:
     description: Toggle the Hematite action bar and show generation totals, or simulate players flying

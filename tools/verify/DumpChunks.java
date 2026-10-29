@@ -23,6 +23,21 @@ public class DumpChunks {
 		throw new RuntimeException(name);
 	}
 
+	/** Vanilla's Beardifier from the plugin's ints: affected box, rigid count, rigids (box, adjustment, ground delta), junctions (x, ground y, z). */
+	static Beardifier beardifier(String line) {
+		if (line.isBlank()) return null;
+		int[] d = Arrays.stream(line.trim().split("\\s+")).mapToInt(Integer::parseInt).toArray();
+		var rigids = new ArrayList<Beardifier.Rigid>();
+		var junctions = new ArrayList<net.minecraft.world.level.levelgen.structure.pools.JigsawJunction>();
+		int n = d[6], p = 7;
+		for (int k = 0; k < n; k++, p += 8)
+			rigids.add(new Beardifier.Rigid(new net.minecraft.world.level.levelgen.structure.BoundingBox(d[p], d[p + 1], d[p + 2], d[p + 3], d[p + 4], d[p + 5]),
+				net.minecraft.world.level.levelgen.structure.TerrainAdjustment.values()[d[p + 6]], d[p + 7]));
+		for (; p + 2 < d.length; p += 3)
+			junctions.add(new net.minecraft.world.level.levelgen.structure.pools.JigsawJunction(d[p], d[p + 1], d[p + 2], 0, net.minecraft.world.level.levelgen.structure.pools.StructureTemplatePool.Projection.RIGID));
+		return new Beardifier(rigids, junctions, new net.minecraft.world.level.levelgen.structure.BoundingBox(d[0], d[1], d[2], d[3], d[4], d[5]));
+	}
+
 	public static void main(String[] args) throws Exception {
 		SharedConstants.tryDetectVersion();
 		Bootstrap.bootStrap();
@@ -60,13 +75,16 @@ public class DumpChunks {
 		var rule = settings.materialRule().value();
 		Map<String, Integer> palette = new LinkedHashMap<>();
 		var out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(args[1])));
+		// optional: one line of structure pieces per chunk, in the ints the plugin passes to Rust (empty for none)
+		String beardFile = System.getenv("HEMATITE_BEARDS");
+		Iterator<String> beards = beardFile == null ? Collections.emptyIterator() : java.nio.file.Files.readAllLines(java.nio.file.Path.of(beardFile)).iterator();
 		for (int i = 2; i + 1 < args.length; i += 2) {
 			int cx = Integer.parseInt(args[i]), cz = Integer.parseInt(args[i + 1]);
 			ProtoChunk chunk = new ProtoChunk(new ChunkPos(cx, cz), UpgradeData.EMPTY, height, factory, null);
 			doCreateBiomes.invoke(gen, Blender.empty(), rs, chunk);
 			chunk.setPersistedStatus(net.minecraft.world.level.chunk.status.ChunkStatus.BIOMES);
 			var volume = new DensityVolume(16, 384, 16, cx * 16, -64, cz * 16);
-			try (NoiseChunk nc = new NoiseChunk(rs, null, settings, picker, Blender.empty(), volume)) {
+			try (NoiseChunk nc = new NoiseChunk(rs, beards.hasNext() ? beardifier(beards.next()) : null, settings, picker, Blender.empty(), volume)) {
 				doFill.invoke(gen, nc, chunk);
 				buildSurface.invoke(gen, chunk, nc, rs, biomeManager, null, rule);
 				generateCarvers.invoke(gen, chunk, Blender.empty(), nc, rs, biomeManager, null, rule);

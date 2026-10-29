@@ -85,6 +85,9 @@ fn main() {
 			};
 			let mut out = Vec::new();
 			let mut palette: Vec<String> = vec![];
+			// optional: one line of structure piece ints (see Beard::from_ints) per chunk, empty for none
+			let beards = std::env::var("HEMATITE_BEARDS").map(|p| std::fs::read_to_string(p).unwrap()).unwrap_or_default();
+			let mut beards = beards.lines().map(|l| (!l.trim().is_empty()).then(|| hematite::beard::Beard::from_ints(&l.split_whitespace().map(|n| n.parse().unwrap()).collect::<Vec<i32>>())));
 			for p in args[4..].chunks(2) {
 				let (cx, cz) = (p[0].parse().unwrap(), p[1].parse().unwrap());
 				let start = std::time::Instant::now();
@@ -94,7 +97,7 @@ fn main() {
 					}
 				}
 				let mut l = *last.borrow();
-				let chunk = t.generate(cx, cz, &biomes, &mut l);
+				let chunk = t.generate_cut(cx, cz, &biomes, &mut l, false, beards.next().flatten()).0;
 				*last.borrow_mut() = l;
 				eprintln!("chunk {cx} {cz} in {:?}", start.elapsed());
 				for b in &chunk.blocks {

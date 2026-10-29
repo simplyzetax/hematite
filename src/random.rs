@@ -117,7 +117,7 @@ impl Rng for Xoroshiro {
 	}
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct XoroshiroFactory {
 	pub lo: i64,
 	pub hi: i64,

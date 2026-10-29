@@ -45,6 +45,7 @@ fi
 
 CP=$(find run/libraries run/versions -name '*.jar' | tr '\n' ':')
 javac --release 25 -cp "$CP" -d build/classes src/dev/hematite/*.java
-cp src/plugin.yml build/classes/
-jar cf run/plugins/hematite.jar -C build/classes .
+# VERSION=1.2.0 paper/build.sh stamps that version into the plugin (CI does)
+if [ -n "$VERSION" ]; then sed "s/^version: .*/version: $VERSION/" src/plugin.yml > build/classes/plugin.yml; else cp src/plugin.yml build/classes/; fi
+jar cf run/plugins/hematite.jar.tmp -C build/classes . && mv run/plugins/hematite.jar.tmp run/plugins/hematite.jar # a running test server keeps the old file
 echo "built run/plugins/hematite.jar"

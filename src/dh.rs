@@ -376,7 +376,7 @@ pub fn area_chunks(t: &Terrain, ax: i32, az: i32, n: i32, cut: bool) -> (Vec<Chu
 		}
 	}
 	let biomes = |x: i32, z: i32| cache[&(x, z)].clone();
-	let (mut chunks, mut trusted): (Vec<Chunk>, Vec<[i32; 256]>) = (0..n * n).map(|i| t.generate_cut(ax + i % n, az + i / n, &biomes, &mut last, cut)).unzip();
+	let (mut chunks, mut trusted): (Vec<Chunk>, Vec<[i32; 256]>) = (0..n * n).map(|i| t.generate_cut(ax + i % n, az + i / n, &biomes, &mut last, cut, None)).unzip();
 	loop {
 		let mut bad = if cut { failing(&chunks, &trusted, n) } else { vec![] };
 		if bad.is_empty() {

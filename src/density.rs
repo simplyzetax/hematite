@@ -313,6 +313,7 @@ pub enum S {
 	Select { input: Id, thresholds: Vec<f32>, samplers: Vec<Id> },
 	Single { input: Id, t: f32, below: Id, above: Id },
 	FindTop { density: Id, upper: Id, lower: i32, cell: i32 },
+	Beardifier,
 }
 
 pub struct Compiler<'a> {
@@ -528,6 +529,81 @@ impl<'a> Compiler<'a> {
 		}
 	}
 
+	/// The lowest multiple of 8 above which `f` is surely below zero, structure pieces aside (from its range there).
+	pub fn negative_above(&self, f: &R) -> Option<i32> {
+		// ponytail: margin for float rounding in interpolation, far above what it can add up to
+		let neg = |y: i32| self.range_from_y(f, y).max < -1e-3;
+		neg(320).then(|| (-64..=320).step_by(8).find(|&y| neg(y)).unwrap())
+	}
+
+	/// `range`, but only over points at or above y0; Beardifier counts as 0 there.
+	fn range_from_y(&self, f: &Df, y0: i32) -> Interval {
+		use Df::*;
+		let r = |g: &Df| self.range_from_y(g, y0);
+		match f {
+			Ref(n) => r(&self.reg.function(n)),
+			Beardifier => Interval::exact(0.0),
+			Gradient { axis: 1, tiling: 0, from, to, fv, tv } => {
+				let (lo, hi) = (*from.min(to), *from.max(to));
+				let at = |c: i32| (*fv as f64 + (c.clamp(lo, hi) - from) as f64 * (*tv as f64 - *fv as f64) / (to - from) as f64) as f32;
+				Interval::encapsulating2(at(y0), at(hi))
+			}
+			Interpolated(i, _, cy) => self.range_from_y(i, y0.div_euclid(*cy) * cy),
+			Lerp(a, b, c) => {
+				let ra = r(a);
+				if (ra.min, ra.max) == (0.0, 0.0) {
+					r(b)
+				} else if (ra.min, ra.max) == (1.0, 1.0) {
+					r(c)
+				} else {
+					Interval::lerp(ra, r(b), r(c))
+				}
+			}
+			RangeChoice(i, min, max, a, b) => {
+				let ri = r(i);
+				if ri.nai {
+					Interval::encapsulating(&[r(a), r(b)])
+				} else if ri.min >= *min && ri.max < *max {
+					r(a)
+				} else if ri.max < *min || ri.min >= *max {
+					r(b)
+				} else {
+					Interval::encapsulating(&[r(a), r(b)])
+				}
+			}
+			Unary(u, i) => self.unary_range(*u, r(i)),
+			Binary(b, x, y) => self.binary_range(*b, r(x), r(y)),
+			Clamp(i, a, b) => Interval::clamp(r(i), *a, *b),
+			Cache(i) | BlendDensity(i) | Slice(_, _, i) => r(i),
+			_ => self.range(f),
+		}
+	}
+
+	fn unary_range(&self, u: Un, r: Interval) -> Interval {
+		match u {
+			Un::Abs => Interval::abs(r),
+			Un::Square => Interval::square(r),
+			Un::Cube => Interval::map_monotonic(r, |x| x * x * x),
+			Un::HalfNeg => Interval::map_monotonic(r, |x| if x > 0.0 { x } else { x * 0.5 }),
+			Un::QuarterNeg => Interval::map_monotonic(r, |x| if x > 0.0 { x } else { x * 0.25 }),
+			Un::Recip => Interval::reciprocal(r),
+			Un::Negate => Interval::sub(Interval::exact(0.0), r),
+			Un::Squeeze => Interval::map_monotonic(r, squeeze),
+			u => panic!("range of {u:?} not supported"),
+		}
+	}
+
+	fn binary_range(&self, b: Bin, l: Interval, r: Interval) -> Interval {
+		match b {
+			Bin::Add => Interval::add(l, r),
+			Bin::Sub => Interval::sub(l, r),
+			Bin::Mul => Interval::mul(l, r),
+			Bin::Div => Interval::mul(l, Interval::reciprocal(r)),
+			Bin::Min => Interval::min_of(l, r),
+			Bin::Max => Interval::max_of(l, r),
+		}
+	}
+
 	pub fn range(&self, f: &Df) -> Interval {
 		use Df::*;
 		match f {
@@ -538,31 +614,8 @@ impl<'a> Compiler<'a> {
 			Noise { noise, .. } => self.reg.normal_noise(noise).range,
 			ShiftA(n) | ShiftB(n) | Shift(n) => Interval::mul(self.reg.normal_noise(n).range, Interval::exact(4.0)),
 			Gradient { fv, tv, .. } => Interval::encapsulating2(*fv, *tv),
-			Unary(u, i) => {
-				let r = self.range(i);
-				match u {
-					Un::Abs => Interval::abs(r),
-					Un::Square => Interval::square(r),
-					Un::Cube => Interval::map_monotonic(r, |x| x * x * x),
-					Un::HalfNeg => Interval::map_monotonic(r, |x| if x > 0.0 { x } else { x * 0.5 }),
-					Un::QuarterNeg => Interval::map_monotonic(r, |x| if x > 0.0 { x } else { x * 0.25 }),
-					Un::Recip => Interval::reciprocal(r),
-					Un::Negate => Interval::sub(Interval::exact(0.0), r),
-					Un::Squeeze => Interval::map_monotonic(r, squeeze),
-					u => panic!("range of {u:?} not supported"),
-				}
-			}
-			Binary(b, l, r) => {
-				let (l, r) = (self.range(l), self.range(r));
-				match b {
-					Bin::Add => Interval::add(l, r),
-					Bin::Sub => Interval::sub(l, r),
-					Bin::Mul => Interval::mul(l, r),
-					Bin::Div => Interval::mul(l, Interval::reciprocal(r)),
-					Bin::Min => Interval::min_of(l, r),
-					Bin::Max => Interval::max_of(l, r),
-				}
-			}
+			Unary(u, i) => self.unary_range(*u, self.range(i)),
+			Binary(b, l, r) => self.binary_range(*b, self.range(l), self.range(r)),
 			Clamp(i, a, b) => Interval::clamp(self.range(i), *a, *b),
 			Spline(s) => self.spline_range(s),
 			Lerp(a, b, c) => Interval::lerp(self.range(a), self.range(b), self.range(c)),
@@ -650,7 +703,8 @@ impl<'a> Compiler<'a> {
 		match &**f {
 			Const(v) => self.push(S::Const(*v)),
 			BlendAlpha => self.push(S::Const(1.0)),
-			BlendOffset | Beardifier => self.push(S::Const(0.0)),
+			BlendOffset => self.push(S::Const(0.0)),
+			Beardifier => self.push(S::Beardifier),
 			Ref(_) => panic!("unresolved reference in compile"),
 			Noise { noise, xz, y, sx, sy, sz } => {
 				let n = self.noise(noise);
@@ -963,17 +1017,23 @@ pub struct Ctx {
 	cells: Option<Vec<Cell>>,
 	pool: Vec<Vec<f32>>,
 	masks: Vec<Vec<bool>>,
+	/// Structure pieces that reshape this chunk's terrain, if any.
+	pub beard: Option<crate::beard::Beard>,
 }
 
 impl Ctx {
 	pub fn new(caches: usize, enabled: bool) -> Self {
 		let cells = enabled.then(|| (0..caches).map(|_| Cell { value: f32::NAN, ..Default::default() }).collect());
-		Self { cells, pool: vec![], masks: vec![] }
+		Self { cells, pool: vec![], masks: vec![], beard: None }
 	}
 
+	/// A buffer of `n` values, with whatever an earlier user left in it. Best fit, so it rarely needs filling.
 	pub fn take(&mut self, n: usize) -> Vec<f32> {
-		let mut v = self.pool.pop().unwrap_or_default();
-		v.clear();
+		let fit = (0..self.pool.len()).filter(|&i| self.pool[i].len() >= n).min_by_key(|&i| self.pool[i].len());
+		let mut v = match fit {
+			Some(i) => self.pool.swap_remove(i),
+			None => self.pool.pop().unwrap_or_default(),
+		};
 		v.resize(n, 0.0);
 		v
 	}
@@ -1137,6 +1197,7 @@ impl Graph {
 				let u = self.val(c, *upper, x, y, z);
 				self.find_top(c, *density, *lower, *cell, x, z, u) as f32
 			}
+			S::Beardifier => c.beard.as_ref().map_or(0.0, |b| b.sample(x, y, z)),
 		}
 	}
 
@@ -1284,6 +1345,7 @@ impl Graph {
 			S::ShiftB { n } => {
 				let t = Volume::stepped(v.sz, v.sx, 1, v.mz, v.mx, 0, v.tz, v.tx, 1);
 				let mut tb = c.take(t.size());
+				tb.fill(0.0);
 				self.noises[*n].add_to_volume(&mut tb, &t, 0.25, 0.25, 4.0, None);
 				for z in 0..v.sz {
 					for x in 0..v.sx {
@@ -1569,7 +1631,7 @@ impl Graph {
 				let mut ob = c.take(v.size());
 				self.vm(c, *outr, &mut ob, v, None);
 				for ((o, &b), &x) in out.iter_mut().zip(&ob).zip(&ib) {
-					*o = if x >= *min && x < *max { *o } else { b };
+					*o = if (x >= *min) & (x < *max) { *o } else { b };
 				}
 				c.give(ob);
 				c.give(ib);
@@ -1720,6 +1782,10 @@ impl Graph {
 					}
 				}
 			}
+			S::Beardifier => match &c.beard {
+				Some(b) => b.fill(out, v),
+				None => out.fill(0.0),
+			},
 		}
 	}
 
@@ -1742,14 +1808,21 @@ impl Graph {
 		let cell = &mut c.cells.as_mut().unwrap()[cid];
 		if cell.vol != Some(*v) {
 			cell.vol = Some(*v);
-			cell.buf.clear();
 			cell.buf.resize(n, 0.0);
+			cell.buf.truncate(n);
 			cell.done.clear();
-			cell.done.resize(n, false);
 			cell.full = false;
 		}
-		if !cell.full {
-			let done = std::mem::take(&mut cell.done);
+		if !cell.full && m.is_none() {
+			// all of it at once, no bookkeeping of which values are done
+			let mut buf = std::mem::take(&mut cell.buf);
+			self.vm(c, input, &mut buf, v, None);
+			let cell = &mut c.cells.as_mut().unwrap()[cid];
+			cell.buf = buf;
+			cell.full = true;
+		} else if !cell.full {
+			let mut done = std::mem::take(&mut cell.done);
+			done.resize(n, false);
 			let (need, count) = Self::sub_mask(c, m, n, |i| !done[i]);
 			if count > 0 {
 				let mut buf = c.take(n);
@@ -1861,23 +1934,51 @@ impl Graph {
 					let v111 = cb[cv.idx(nx, ny, nz)];
 					if active.as_ref().is_none_or(|a| a[((cz * cnx + cx) * cny + cyi) as usize]) {
 						let (ox, oy, oz, x0, y0, z0, x1, y1, z1) = cell_range(cx, cyi, cz);
-						for z in z0..=z1 {
-							let az = z as f32 * ixz;
-							let v00 = lerp(az, v000, v001);
-							let v01 = lerp(az, v010, v011);
-							let v10 = lerp(az, v100, v101);
-							let v11 = lerp(az, v110, v111);
-							for x in x0..=x1 {
-								let ax = x as f32 * ixz;
-								let a = lerp(ax, v00, v10);
-								let b = lerp(ax, v01, v11);
-								let step = (b - a) * iy;
-								let mut value = a + step * y0 as f32;
-								let mut oi = v.idx(ox + x, oy + y0, oz + z);
-								for _ in y0..=y1 {
-									out[oi] = value;
-									oi += 1;
-									value += step;
+						if (cxz, cy, x0, x1, y0, y1) == (4, 8, 0, 3, 0, 7) {
+							// a whole cell row: its four columns side by side, so the adds vectorize
+							for z in z0..=z1 {
+								let az = z as f32 * ixz;
+								let (v00, v01, v10, v11) = (lerp(az, v000, v001), lerp(az, v010, v011), lerp(az, v100, v101), lerp(az, v110, v111));
+								let (mut val, mut st) = ([0f32; 4], [0f32; 4]);
+								for x in 0..4 {
+									let ax = x as f32 * ixz;
+									let (a, b) = (lerp(ax, v00, v10), lerp(ax, v01, v11));
+									st[x] = (b - a) * iy;
+									val[x] = a + st[x] * 0.0;
+								}
+								let mut rows = [[0f32; 4]; 8];
+								for row in &mut rows {
+									*row = val;
+									for x in 0..4 {
+										val[x] += st[x];
+									}
+								}
+								for x in 0..4 {
+									let oi = v.idx(ox + x as i32, oy, oz + z);
+									for (o, row) in out[oi..oi + 8].iter_mut().zip(&rows) {
+										*o = row[x];
+									}
+								}
+							}
+						} else {
+							for z in z0..=z1 {
+								let az = z as f32 * ixz;
+								let v00 = lerp(az, v000, v001);
+								let v01 = lerp(az, v010, v011);
+								let v10 = lerp(az, v100, v101);
+								let v11 = lerp(az, v110, v111);
+								for x in x0..=x1 {
+									let ax = x as f32 * ixz;
+									let a = lerp(ax, v00, v10);
+									let b = lerp(ax, v01, v11);
+									let step = (b - a) * iy;
+									let mut value = a + step * y0 as f32;
+									let mut oi = v.idx(ox + x, oy + y0, oz + z);
+									for _ in y0..=y1 {
+										out[oi] = value;
+										oi += 1;
+										value += step;
+									}
 								}
 							}
 						}

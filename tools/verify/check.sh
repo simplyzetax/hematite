@@ -1,6 +1,7 @@
 #!/bin/sh
 # Compare Rust chunks block-by-block with Mojang's generator (noise, biomes, surface, carvers).
-# usage: tools/verify/check.sh <seed> [chunk count]
+# With "structures", every chunk also gets random structure pieces that reshape terrain (Mojang's Beardifier).
+# usage: tools/verify/check.sh <seed> [chunk count] [structures]
 set -e
 cd "$(dirname "$0")/../.."
 M="$HOME/Library/Application Support/ModrinthApp/meta"
@@ -15,6 +16,10 @@ print(':'.join(libs + [sys.argv[3]]))" "$M/versions/$V/$V.json" "$M" "$M/version
 javac -cp "$CP" -d "$OUT" tools/verify/DumpChunks.java 2>&1 | grep -v '^Note' || true
 cargo build --release -q
 COORDS=$(python3 -c "import random; r = random.Random(1); print(' '.join(f'{r.randint(-3000, 3000)} {r.randint(-3000, 3000)}' for _ in range(${2:-100})))")
+if [ "$3" = structures ]; then
+	python3 tools/verify/random_beards.py $COORDS > "$OUT/beards.txt"
+	export HEMATITE_BEARDS="$OUT/beards.txt"
+fi
 java -cp "$CP:$OUT" DumpChunks "$1" "$OUT/java_chunks.bin" $COORDS > "$OUT/java.log" 2>&1
 ./target/release/hematite dump-chunks "$1" "$OUT/rust_chunks.bin" $COORDS 2>/dev/null
 python3 tools/verify/cmp_chunks.py "$OUT"

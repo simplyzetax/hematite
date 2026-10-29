@@ -1,3 +1,4 @@
+pub mod beard;
 pub mod biome;
 pub mod density;
 pub mod dh;

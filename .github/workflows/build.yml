@@ -1,0 +1,51 @@
+# Builds the plugin with engines for every platform and keeps the jar as a workflow artifact.
+# Pushes to main also upload it to Modrinth as an alpha, tags like v1.2.0 as a release, once the repository has
+# a MODRINTH_TOKEN secret (a Modrinth personal access token with "Create versions") and a MODRINTH_PROJECT_ID variable.
+name: build
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest # Apple Silicon: both macOS engines natively, Linux and Windows through zig
+    env:
+      MODRINTH_TOKEN: ${{ secrets.MODRINTH_TOKEN }}
+      MODRINTH_PROJECT_ID: ${{ vars.MODRINTH_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 25
+      - name: Rust targets, zig and cargo-zigbuild
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-gnu
+          brew install zig
+          cargo install cargo-zigbuild --locked --version 0.24.0
+      - name: Version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"; echo "CHANNEL=release" >> "$GITHUB_ENV"
+          else
+            echo "VERSION=$(sed -n 's/^version: //p' paper/src/plugin.yml)-build.$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"; echo "CHANNEL=alpha" >> "$GITHUB_ENV"
+          fi
+      - run: paper/build.sh --all && cp paper/run/plugins/hematite.jar "hematite-$VERSION.jar"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hematite-${{ env.VERSION }}
+          path: hematite-${{ env.VERSION }}.jar
+      - name: Upload to Modrinth
+        if: github.event_name == 'push' && env.MODRINTH_TOKEN != '' && env.MODRINTH_PROJECT_ID != ''
+        run: |
+          jq -n --arg v "$VERSION" --arg channel "$CHANNEL" --arg project "$MODRINTH_PROJECT_ID" --arg log "$(git log -1 --format=%B)" \
+            --arg mc "$(sed -n "s/^api-version: '\(.*\)'/\1/p" paper/src/plugin.yml)" \
+            '{name: "Hematite \($v)", version_number: $v, changelog: $log, dependencies: [], game_versions: [$mc], version_type: $channel,
+              loaders: ["paper"], featured: ($channel == "release"), project_id: $project, file_parts: ["jar"], primary_file: "jar"}' > data.json
+          curl --fail-with-body -sS https://api.modrinth.com/v2/version \
+            -H "Authorization: $MODRINTH_TOKEN" -H "User-Agent: $GITHUB_REPOSITORY (GitHub Actions)" \
+            -F "data=<data.json;type=application/json" -F "jar=@hematite-$VERSION.jar;type=application/java-archive"

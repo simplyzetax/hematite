@@ -115,6 +115,9 @@ fn global_fluid(y: i32) -> Fluid {
 	if y < -54 { Fluid { level: -54, ty: LAVA } } else { Fluid { level: SEA, ty: WATER } }
 }
 
+/// apply_span: undecided, no better place to split than the middle.
+const NO_SPLIT: i32 = i32::MIN;
+
 const SURFACE_OFFSETS: [[i32; 2]; 13] =
 	[[0, 0], [-2, -1], [-1, -1], [0, -1], [1, -1], [-3, 0], [-2, 0], [-1, 0], [1, 0], [-2, 1], [-1, 1], [0, 1], [1, 1]];
 
@@ -130,6 +133,34 @@ fn map(v: f64, a: f64, b: f64, c: f64, d: f64) -> f64 {
 	c + (v - a) / (b - a) * (d - c)
 }
 
+/// Preliminary surface heights by quart position, shared by all threads: neighbouring chunks' aquifers ask for
+/// mostly the same ones. Lossy (a colliding position just gets computed again); entries pack valid, x, z, height.
+struct SurfaceCache(Box<[std::sync::atomic::AtomicU64]>);
+
+impl SurfaceCache {
+	fn new() -> Self {
+		Self((0..1 << 16).map(|_| Default::default()).collect())
+	}
+
+	fn slot(&self, qx: i32, qz: i32) -> (&std::sync::atomic::AtomicU64, u64) {
+		let h = (qx as u32).wrapping_mul(0x9E37_79B1) ^ (qz as u32).wrapping_mul(0x85EB_CA77);
+		(&self.0[(h >> 16) as usize], 1 << 63 | (qx as u64 & 0xFF_FFFF) << 34 | (qz as u64 & 0xFF_FFFF) << 10)
+	}
+
+	fn get(&self, qx: i32, qz: i32) -> Option<i32> {
+		let (e, key) = self.slot(qx, qz);
+		let e = e.load(std::sync::atomic::Ordering::Relaxed);
+		(e & !0x3FF == key).then(|| (e & 0x3FF) as i32 - 512)
+	}
+
+	fn put(&self, qx: i32, qz: i32, v: i32) {
+		let (e, key) = self.slot(qx, qz);
+		if (-512..512).contains(&v) {
+			e.store(key | (v + 512) as u64, std::sync::atomic::Ordering::Relaxed);
+		}
+	}
+}
+
 struct Aquifer {
 	min_gx: i32,
 	min_gy: i32,
@@ -139,7 +170,6 @@ struct Aquifer {
 	status: Vec<Option<Fluid>>,
 	loc: Vec<Option<(i32, i32, i32)>>,
 	skip_above: i32,
-	surface_cache: HashMap<(i32, i32), i32>,
 	/// (x, z, grid y) the candidates below are for: (grid index, horizontal distance squared, y)
 	cand_at: (i32, i32, i32),
 	cand: [(usize, i32, i32); 12],
@@ -164,7 +194,6 @@ impl Aquifer {
 			status: vec![None; n],
 			loc: vec![None; n],
 			skip_above: 0,
-			surface_cache: HashMap::new(),
 			cand_at: (i32::MIN, 0, 0),
 			cand: [(0, 0, 0); 12],
 		};
@@ -175,24 +204,22 @@ impl Aquifer {
 	}
 
 	fn max_surface(&mut self, t: &Terrain, c: &mut Ctx, min_x: i32, min_z: i32, max_x: i32, max_z: i32) -> i32 {
-		let (qx0, qx1, qz0, qz1) = (min_x >> 2, max_x >> 2, min_z >> 2, max_z >> 2);
-		let v = Volume::stepped(qx1 - qx0 + 1, 1, qz1 - qz0 + 1, qx0 << 2, 0, qz0 << 2, 4, 1, 4);
-		let mut buf = vec![0f32; v.size()];
-		t.g.vol(c, t.aq_surface, &mut buf, &v);
 		let mut max = i32::MIN;
-		for z in 0..v.sz {
-			for x in 0..v.sx {
-				let s = floor(buf[v.idx(x, 0, z)] as f64);
-				self.surface_cache.insert((v.block_x(x), v.block_z(z)), s);
-				max = max.max(s);
+		for qz in min_z >> 2..=max_z >> 2 {
+			for qx in min_x >> 2..=max_x >> 2 {
+				max = max.max(self.surface_level(t, c, qx << 2, qz << 2));
 			}
 		}
 		max
 	}
 
 	fn surface_level(&mut self, t: &Terrain, c: &mut Ctx, bx: i32, bz: i32) -> i32 {
-		let (qx, qz) = ((bx >> 2) << 2, (bz >> 2) << 2);
-		*self.surface_cache.entry((qx, qz)).or_insert_with(|| floor(t.g.val(c, t.aq_surface, qx, 0, qz) as f64))
+		let (qx, qz) = (bx >> 2, bz >> 2);
+		t.surfaces.get(qx, qz).unwrap_or_else(|| {
+			let s = floor(t.g.val(c, t.aq_surface, qx << 2, 0, qz << 2) as f64);
+			t.surfaces.put(qx, qz, s);
+			s
+		})
 	}
 
 	fn index(&self, gx: i32, gy: i32, gz: i32) -> usize {
@@ -234,27 +261,23 @@ impl Aquifer {
 				}
 			}
 		}
-		let (mut d0, mut d1, mut d2, mut d3) = (i32::MAX, i32::MAX, i32::MAX, i32::MAX);
-		let (mut c0, mut c1, mut c2, mut c3) = (0usize, 0usize, 0usize, 0usize);
+		// the three nearest (vanilla tracks four, but the fourth only schedules fluid updates)
+		let (mut d0, mut d1, mut d2) = (i32::MAX, i32::MAX, i32::MAX);
+		let (mut c0, mut c1, mut c2) = (0usize, 0usize, 0usize);
 		for &(index, dxz, ly) in &self.cand {
 			let dy = ly - by;
 			let nd = dxz + dy * dy;
-			// insert into the sorted d0..d3 (later equal ones go first), written as selects
-			let (b0, b1, b2, b3) = (d0 >= nd, d1 >= nd, d2 >= nd, d3 >= nd);
-			(d3, c3) = if b2 { (d2, c2) } else if b3 { (nd, index) } else { (d3, c3) };
+			// insert into the sorted d0..d2 (later equal ones go first), written as selects
+			let (b0, b1, b2) = (d0 >= nd, d1 >= nd, d2 >= nd);
 			(d2, c2) = if b1 { (d1, c1) } else if b2 { (nd, index) } else { (d2, c2) };
 			(d1, c1) = if b0 { (d0, c0) } else if b1 { (nd, index) } else { (d1, c1) };
 			(d0, c0) = if b0 { (nd, index) } else { (d0, c0) };
 		}
-		let (d, ci) = ([d0, d1, d2, d3], [c0, c1, c2, c3]);
-		let flow = similarity(100, 144);
+		let (d, ci) = ([d0, d1, d2], [c0, c1, c2]);
 		let s1 = self.get_status(t, c, ci[0]);
 		let sim12 = similarity(d[0], d[1]);
 		let fluid = s1.at(by);
 		if sim12 <= 0.0 {
-			if sim12 >= flow {
-				self.get_status(t, c, ci[1]);
-			}
 			return Some(fluid);
 		}
 		if fluid == WATER && global_fluid(by - 1).at(by - 1) == LAVA {
@@ -273,10 +296,6 @@ impl Aquifer {
 		let sim23 = similarity(d[1], d[2]);
 		if sim23 > 0.0 && density + sim12 * sim23 * self.pressure(t, c, bx, by, bz, &mut barrier, s2, s3) > 0.0 {
 			return None;
-		}
-		let may_flow = s1 != s2 || (sim23 >= flow && s2 != s3) || (sim13 >= flow && s1 != s3);
-		if !may_flow && sim13 >= flow && similarity(d[0], d[3]) >= flow {
-			self.get_status(t, c, ci[3]);
 		}
 		Some(fluid)
 	}
@@ -680,6 +699,37 @@ impl Mask {
 	}
 }
 
+/// vertical_gradient: true below the band, false above, a coin flip weighted by height inside it.
+fn flip(rf: &XoroshiroFactory, true_at: i32, false_at: i32, x: i32, y: i32, z: i32) -> bool {
+	if y <= true_at {
+		true
+	} else if y >= false_at {
+		false
+	} else {
+		let p = map(y as f64, true_at as f64, false_at as f64, 1.0, 0.0);
+		(rf.at(x, y, z).next_float() as f64) < p
+	}
+}
+
+/// The rule's vertical gradients (true_at, false_at, random).
+fn gradients(r: &Rule, out: &mut Vec<(i32, i32, XoroshiroFactory)>) {
+	fn cond(c: &Cond, out: &mut Vec<(i32, i32, XoroshiroFactory)>) {
+		match c {
+			Cond::Gradient { rf, true_at, false_at } => out.push((*true_at, *false_at, *rf)),
+			Cond::Not(c) => cond(c, out),
+			_ => {}
+		}
+	}
+	match r {
+		Rule::Seq(rs) => rs.iter().for_each(|r| gradients(r, out)),
+		Rule::Cond(c, then) => {
+			cond(c, out);
+			gradients(then, out);
+		}
+		_ => {}
+	}
+}
+
 fn ceiling_offset(r: &Rule) -> i32 {
 	fn cond(c: &Cond) -> i32 {
 		match c {
@@ -957,7 +1007,11 @@ pub struct Terrain {
 	aq: [Id; 5],
 	aq_surface: Id,
 	chunk_surface: Id,
+	/// Final density is below zero from here up (structure pieces aside), so those blocks are air.
+	air_above: i32,
+	surfaces: SurfaceCache,
 	rule: Rule,
+	gradients: Vec<(i32, i32, XoroshiroFactory)>,
 	ceiling_offset: i32,
 	ores: Vec<(Id, Id)>,
 	noise_random: XoroshiroFactory,
@@ -1049,6 +1103,8 @@ struct Span {
 }
 
 struct RuleCtx {
+	/// test_span answers this one of `gradients` as given
+	assume: Option<(usize, bool)>,
 	ore_bufs: Vec<Option<(Volume, Vec<f32>, Vec<f32>)>>,
 	prelim_vol: Volume,
 	prelim: Option<Vec<f32>>,
@@ -1084,7 +1140,9 @@ impl Terrain {
 		let aquifers = &settings["aquifers"];
 		let aq_surface = fun(&mut comp, &aquifers["surface_level"]);
 		let aq = ["barrier", "fluid_level_floodedness", "fluid_level_spread", "lava", "exclusion"].map(|k| fun(&mut comp, &aquifers[k]));
-		let final_density = fun(&mut comp, &router["final_density"]);
+		let final_parsed = parse(&router["final_density"]);
+		let air_above = comp.negative_above(&final_parsed).unwrap_or(MIN_Y + HEIGHT);
+		let final_density = comp.sampler(&final_parsed);
 		let chunk_surface = fun(&mut comp, &router["chunk_surface_level"]);
 		let table = BiomeTable::overworld();
 		let mut palette = Palette { names: FIXED.iter().map(|s| s.to_string()).collect() };
@@ -1145,10 +1203,17 @@ impl Terrain {
 			zoom_seed: zoom_seed(seed),
 			climate,
 			final_density,
+			air_above,
+			surfaces: SurfaceCache::new(),
 			aq,
 			aq_surface,
 			chunk_surface,
 			ceiling_offset: ceiling_offset(&rule).max(0),
+			gradients: {
+				let mut g = vec![];
+				gradients(&rule, &mut g);
+				g
+			},
 			rule,
 			ores,
 			noise_random: random,
@@ -1191,28 +1256,33 @@ impl Terrain {
 	}
 
 	pub fn generate(&self, cx: i32, cz: i32, biomes: &dyn Fn(i32, i32) -> std::sync::Arc<Vec<u16>>, last: &mut Option<usize>) -> Chunk {
-		self.generate_cut(cx, cz, biomes, last, false).0
+		self.generate_cut(cx, cz, biomes, last, false, None).0
 	}
 
 	/// With `cut`, columns are only generated down to roughly what Distant Horizons culling keeps.
 	/// Also returns, per column (index z * 16 + x), the lowest y whose blocks are exact (MIN_Y when not cut).
-	pub fn generate_cut(&self, cx: i32, cz: i32, biomes: &dyn Fn(i32, i32) -> std::sync::Arc<Vec<u16>>, last: &mut Option<usize>, cut: bool) -> (Chunk, [i32; 256]) {
+	/// `beard`: structure pieces that reshape this chunk's terrain.
+	pub fn generate_cut(&self, cx: i32, cz: i32, biomes: &dyn Fn(i32, i32) -> std::sync::Arc<Vec<u16>>, last: &mut Option<usize>, cut: bool, beard: Option<crate::beard::Beard>) -> (Chunk, [i32; 256]) {
 		let mut chunk = Chunk::new(cx, cz);
 		let v = Volume::new(16, HEIGHT, 16, cx * 16, MIN_Y, cz * 16);
 		let mut c = Ctx::new(self.g.cache_count, true);
+		c.beard = beard;
 		let mut aq = Aquifer::new(self, &mut c, &v);
-		let mut dens = vec![0f32; v.size()];
+		let mut dens = vec![-1f32; v.size()];
 		let split = if cut {
 			let s = (0..16).map(|q| aq.surface_level(self, &mut c, cx * 16 + (q & 3) * 4, cz * 16 + (q >> 2) * 4)).min().unwrap();
 			((s - CUT_SPLIT).div_euclid(8) * 8).clamp(MIN_Y, MIN_Y + HEIGHT)
 		} else {
 			MIN_Y
 		};
-		self.density_range(&mut c, &mut dens, &v, split, MIN_Y + HEIGHT);
+		// above air_above only the sign matters, except to the aquifer below skip_above and around structure pieces
+		let top = (self.air_above.max(aq.skip_above + 1).max(c.beard.as_ref().map_or(MIN_Y, |b| b.max_y() + 1)) + 7).div_euclid(8) * 8;
+		let top = top.min(MIN_Y + HEIGHT);
+		self.density_range(&mut c, &mut dens, &v, split.min(top), top);
 		let mask = self.carve_mask(cx, cz, last);
 		let mut lo = if cut { self.cut_depths(&dens, &v, mask.as_ref()) } else { [MIN_Y; 256] };
-		if *lo.iter().min().unwrap() < split {
-			self.density_range(&mut c, &mut dens, &v, MIN_Y, split);
+		if *lo.iter().min().unwrap() < split.min(top) {
+			self.density_range(&mut c, &mut dens, &v, MIN_Y, split.min(top));
 			lo = self.cut_depths(&dens, &v, mask.as_ref());
 		}
 		for z in 0..16 {
@@ -1221,13 +1291,13 @@ impl Terrain {
 				let dense_top = dens[d0..d0 + HEIGHT as usize].iter().rposition(|&d| d > 0.0).map_or(0, |y| y as i32);
 				// above this, compute() can only answer air
 				let top = dense_top.max(aq.skip_above - MIN_Y).max(SEA - 1 - MIN_Y).min(HEIGHT - 1);
-				for y in (lo[(z << 4 | x) as usize] - MIN_Y..=top).rev() {
-					let by = MIN_Y + y;
-					let s = aq.compute(self, &mut c, cx * 16 + x, by, cz * 16 + z, dens[v.idx(x, y, z)] as f64).unwrap_or(STONE);
-					if s != AIR {
-						chunk.set(x, by, z, s);
-					}
+				let col = (z << 4 | x) as usize;
+				let blocks = &mut chunk.blocks[col * HEIGHT as usize..][..HEIGHT as usize];
+				for y in (lo[col] - MIN_Y..=top).rev() {
+					let d = dens[d0 + y as usize];
+					blocks[y as usize] = if d > 0.0 { STONE } else { aq.compute(self, &mut c, cx * 16 + x, MIN_Y + y, cz * 16 + z, d as f64).unwrap_or(STONE) };
 				}
+				chunk.height[col] = blocks.iter().rposition(|&b| b != AIR).map_or(MIN_Y, |y| MIN_Y + y as i32 + 1);
 			}
 		}
 		drop(dens);
@@ -1304,7 +1374,7 @@ impl Terrain {
 			.ores
 			.iter()
 			.map(|&(d, r)| {
-				let (lo, hi) = self.g.y_band(d).map_or((vol.my, vol.max_y() + 1), |(lo, hi)| (lo.div_euclid(16) * 16, (hi + 15).div_euclid(16) * 16));
+				let (lo, hi) = self.g.y_band(d).map_or((vol.my, vol.max_y() + 1), |(lo, hi)| (lo.div_euclid(8) * 8, (hi + 7).div_euclid(8) * 8));
 				let (lo, hi) = (lo.max(vol.my), hi.min(vol.max_y() + 1));
 				(lo < hi).then(|| {
 					let ov = Volume::new(vol.sx, hi - lo, vol.sz, vol.mx, lo, vol.mz);
@@ -1317,6 +1387,7 @@ impl Terrain {
 			})
 			.collect();
 		RuleCtx {
+			assume: None,
 			ore_bufs,
 			prelim_vol: Volume::new(vol.sx, 1, vol.sz, vol.mx, 0, vol.mz),
 			prelim: None,
@@ -1404,16 +1475,7 @@ impl Terrain {
 				let v = cache[*n];
 				v >= *min && v <= *max
 			}
-			Cond::Gradient { rf, true_at, false_at } => {
-				if rc.by <= *true_at {
-					true
-				} else if rc.by >= *false_at {
-					false
-				} else {
-					let p = map(rc.by as f64, *true_at as f64, *false_at as f64, 1.0, 0.0);
-					(rf.at(rc.bx, rc.by, rc.bz).next_float() as f64) < p
-				}
-			}
+			Cond::Gradient { rf, true_at, false_at } => flip(rf, *true_at, *false_at, rc.bx, rc.by, rc.bz),
 			Cond::YAbove { anchor, mult, add } => rc.by + if *add { rc.stone_above } else { 0 } >= anchor + rc.surface_depth * mult,
 			Cond::Water { offset, mult, add } => {
 				rc.water == i32::MIN || rc.by + if *add { rc.stone_above } else { 0 } >= rc.water + offset + rc.surface_depth * mult
@@ -1485,18 +1547,42 @@ impl Terrain {
 	/// whole range (deep stone mostly does), that range takes one evaluation instead of one per block.
 	#[allow(clippy::too_many_arguments)]
 	fn fill(&self, chunk: &mut Chunk, rc: &mut RuleCtx, c: &mut Ctx, biome: &dyn Fn(i32, i32, i32) -> u16, x: i32, z: i32, s: Span) {
-		if s.y1 - s.y0 >= 4 {
-			if let Some(r) = self.apply_span(&self.rule, rc, c, &s) {
-				if let Some(b) = r {
-					for y in s.y0..=s.y1 {
+		// inside a vertical gradient's band (bedrock, deepslate) often only its coin flip differs per block:
+		// decide the span for both outcomes, then flip per block
+		if s.y1 - s.y0 >= 2
+			&& let Some(g) = self.gradients.iter().position(|&(t, f, _)| s.y0 > t && s.y1 < f)
+		{
+			let both = [true, false].map(|v| {
+				rc.assume = Some((g, v));
+				self.apply_span(&self.rule, rc, c, &s)
+			});
+			rc.assume = None;
+			if let [Ok(yes), Ok(no)] = both {
+				let (t, f, rf) = &self.gradients[g];
+				for y in s.y0..=s.y1 {
+					if let Some(b) = if flip(rf, *t, *f, rc.bx, y, rc.bz) { yes } else { no } {
 						chunk.set(x, y, z, b);
 					}
 				}
 				return;
 			}
-			let mid = (s.y0 + s.y1).div_euclid(2);
-			self.fill(chunk, rc, c, biome, x, z, Span { y0: mid + 1, ..s });
-			self.fill(chunk, rc, c, biome, x, z, Span { y1: mid, ..s });
+		}
+		if s.y1 - s.y0 >= 4 {
+			let at = match self.apply_span(&self.rule, rc, c, &s) {
+				Ok(r) => {
+					if let Some(b) = r {
+						for y in s.y0..=s.y1 {
+							chunk.set(x, y, z, b);
+						}
+					}
+					return;
+				}
+				// undecided: split where the deciding condition flips, else in the middle
+				Err(h) if h > s.y0 && h <= s.y1 => h,
+				Err(_) => (s.y0 + s.y1).div_euclid(2) + 1,
+			};
+			self.fill(chunk, rc, c, biome, x, z, Span { y0: at, ..s });
+			self.fill(chunk, rc, c, biome, x, z, Span { y1: at - 1, ..s });
 			return;
 		}
 		for y in (s.y0..=s.y1).rev() {
@@ -1507,75 +1593,93 @@ impl Terrain {
 		}
 	}
 
-	/// `apply` for every block of a span at once: Some(answer) if it's the same for all of them, None if it varies.
-	fn apply_span(&self, rule: &Rule, rc: &mut RuleCtx, c: &mut Ctx, s: &Span) -> Option<Option<B>> {
+	/// `apply` for every block of a span at once: Ok(answer) if it's the same for all of them. If it varies, Err with
+	/// the y where it likely changes (the span splits into ..y-1 and y..), or NO_SPLIT.
+	fn apply_span(&self, rule: &Rule, rc: &mut RuleCtx, c: &mut Ctx, s: &Span) -> Result<Option<B>, i32> {
 		match rule {
-			Rule::Block(b) => Some(Some(*b)),
+			Rule::Block(b) => Ok(Some(*b)),
 			Rule::Seq(items) => {
 				for r in items {
 					if let Some(b) = self.apply_span(r, rc, c, s)? {
-						return Some(Some(b));
+						return Ok(Some(b));
 					}
 				}
-				Some(None)
+				Ok(None)
 			}
 			Rule::Cond(cond, then) => match self.test_span(cond, rc, c, s) {
-				Some(true) => self.apply_span(then, rc, c, s),
-				Some(false) => Some(None),
+				Ok(true) => self.apply_span(then, rc, c, s),
+				Ok(false) => Ok(None),
 				// unknown condition: still fine if the branch can't place anything here
-				None => self.apply_span(then, rc, c, s)?.is_none().then_some(None),
+				Err(h) => match self.apply_span(then, rc, c, s) {
+					Ok(None) => Ok(None),
+					Err(h2) if h == NO_SPLIT => Err(h2),
+					_ => Err(h),
+				},
 			},
-			Rule::Bandlands => None,
+			Rule::Bandlands => Err(NO_SPLIT),
 			Rule::Ore { k, .. } => {
 				// places nothing unless the vein density is above 0; outside the buffer's y band it's a constant <= 0
-				let Some((ov, db, _)) = &rc.ore_bufs[*k] else { return Some(None) };
+				let Some((ov, db, _)) = &rc.ore_bufs[*k] else { return Ok(None) };
 				let (a, b) = (s.y0.max(ov.my), s.y1.min(ov.max_y()));
 				if a > b {
-					return Some(None);
+					return Ok(None);
 				}
-				let (i, j) = (ov.index_of(rc.bx, a, rc.bz)?, ov.index_of(rc.bx, b, rc.bz)?);
-				db[i..=j].iter().all(|&d| d <= 0.0).then_some(None)
+				let (Some(i), Some(j)) = (ov.index_of(rc.bx, a, rc.bz), ov.index_of(rc.bx, b, rc.bz)) else { return Err(NO_SPLIT) };
+				// split just above the highest block that might get ore, or right below it if it's the span's top
+				match db[i..=j].iter().rposition(|&d| d > 0.0) {
+					None => Ok(None),
+					Some(k) => Err(if a + k as i32 == s.y1 { s.y1 } else { a + k as i32 + 1 }),
+				}
 			}
 		}
 	}
 
-	/// `test` for every block of a span at once: Some(result) if it's the same for all of them.
-	fn test_span(&self, cond: &Cond, rc: &mut RuleCtx, c: &mut Ctx, s: &Span) -> Option<bool> {
-		// value >= thr for every value in lo..=hi?
-		let at_least = |lo: i32, hi: i32, thr: i32| if lo >= thr { Some(true) } else if hi < thr { Some(false) } else { None };
+	/// `test` for every block of a span at once: Ok(result) if it's the same for all of them, else Err like apply_span.
+	fn test_span(&self, cond: &Cond, rc: &mut RuleCtx, c: &mut Ctx, s: &Span) -> Result<bool, i32> {
+		// value >= thr for every value in lo..=hi? (lo, hi: the span's y range)
+		let at_least = |lo: i32, hi: i32, thr: i32| if lo >= thr { Ok(true) } else if hi < thr { Ok(false) } else { Err(thr) };
 		match cond {
-			Cond::Biome(set) => (rc.present & set == 0).then_some(false),
+			Cond::Biome(set) => if rc.present & set == 0 { Ok(false) } else { Err(NO_SPLIT) },
 			Cond::Noise { n, min, max, is3d: false } => {
 				if rc.noise2d[*n].is_nan() {
 					rc.noise2d[*n] = self.g.noises[*n].get(rc.bx as f64, 0.0, rc.bz as f64) as f64;
 				}
 				let v = rc.noise2d[*n];
-				Some(v >= *min && v <= *max)
+				Ok(v >= *min && v <= *max)
 			}
-			Cond::Noise { is3d: true, .. } => None,
-			Cond::Gradient { true_at, false_at, .. } => {
+			Cond::Noise { is3d: true, .. } => Err(NO_SPLIT),
+			Cond::Gradient { rf, true_at, false_at } => {
+				if let Some((g, v)) = rc.assume
+					&& self.gradients[g] == (*true_at, *false_at, *rf)
+				{
+					return Ok(v);
+				}
 				if s.y1 <= *true_at {
-					Some(true)
+					Ok(true)
 				} else if s.y0 >= *false_at {
-					Some(false)
+					Ok(false)
+				} else if s.y0 <= *true_at {
+					Err(true_at + 1)
+				} else if s.y1 >= *false_at {
+					Err(*false_at)
 				} else {
-					None
+					Err(NO_SPLIT)
 				}
 			}
 			// y + stone above is the same for every block of a run
 			Cond::YAbove { anchor, mult, add } => {
 				let thr = anchor + rc.surface_depth * mult;
-				if *add { Some(s.above0 + s.top + 1 >= thr) } else { at_least(s.y0, s.y1, thr) }
+				if *add { Ok(s.above0 + s.top + 1 >= thr) } else { at_least(s.y0, s.y1, thr) }
 			}
 			Cond::Water { offset, mult, add } => {
 				if s.water == i32::MIN {
-					return Some(true);
+					return Ok(true);
 				}
 				let thr = s.water + offset + rc.surface_depth * mult;
-				if *add { Some(s.above0 + s.top + 1 >= thr) } else { at_least(s.y0, s.y1, thr) }
+				if *add { Ok(s.above0 + s.top + 1 >= thr) } else { at_least(s.y0, s.y1, thr) }
 			}
-			Cond::Steep => Some(rc.grad_x <= -4 || rc.grad_z >= 4),
-			Cond::Hole => Some(rc.surface_depth <= 0),
+			Cond::Steep => Ok(rc.grad_x <= -4 || rc.grad_z >= 4),
+			Cond::Hole => Ok(rc.surface_depth <= 0),
 			Cond::AbovePreliminary => {
 				let m = self.min_surface(rc, c);
 				at_least(s.y0, s.y1, m)
@@ -1592,11 +1696,13 @@ impl Terrain {
 				};
 				let thr = 1 + offset + sd + sec;
 				if hi <= thr {
-					Some(true)
+					Ok(true)
 				} else if lo > thr {
-					Some(false)
+					Ok(false)
+				} else if *ceiling {
+					Err(thr + s.bot) // true up to y = thr + bot - 1
 				} else {
-					None
+					Err(s.above0 + s.top + 1 - thr) // true from here up
 				}
 			}
 			Cond::Not(inner) => self.test_span(inner, rc, c, s).map(|b| !b),

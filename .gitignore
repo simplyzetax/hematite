@@ -4,3 +4,4 @@ paper/run
 paper/build
 logs
 __pycache__
+dist

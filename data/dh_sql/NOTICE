@@ -1,0 +1,3 @@
+These SQL scripts are Distant Horizons' database migrations, copied unchanged so that Hematite writes databases
+Distant Horizons can read. They come from https://gitlab.com/distant-horizons-team/distant-horizons and are licensed
+under the GNU Lesser General Public License v3.0 (https://www.gnu.org/licenses/lgpl-3.0.html), not under Hematite's MIT license.
