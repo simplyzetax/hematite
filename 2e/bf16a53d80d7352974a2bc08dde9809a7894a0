@@ -1,0 +1,20 @@
+.github/workflows/build.yml
+  s_8708ec28af4d51::t_f16de7b31382b8 45
+  s_8708ec28af4d51::t_c00977b6d3c2d1 36-37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2ebf16a53d80d7352974a2bc08dde9809a7894a0",
+  "prompts": {},
+  "sessions": {
+    "s_8708ec28af4d51": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "554de355-71fe-4150-b00d-3deb4c84d609",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Finn <ernzerhofffinn@icloud.com>"
+    }
+  }
+}
