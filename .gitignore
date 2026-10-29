@@ -1,0 +1,6 @@
+target
+.omc
+paper/run
+paper/build
+logs
+__pycache__

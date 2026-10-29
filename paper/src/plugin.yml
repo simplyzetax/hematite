@@ -1,0 +1,15 @@
+name: Hematite
+version: 0.1.0
+main: dev.hematite.HematitePlugin
+api-version: '26.3'
+load: STARTUP
+description: Generates terrain (noise, surface, caves) in Rust; vanilla does the rest.
+commands:
+  hematite:
+    description: Toggle the Hematite action bar and show generation totals, or simulate players flying
+    permission: hematite.admin
+    usage: "/hematite, or /hematite fly <blocks/s> <seconds> [view distance] [players] [on|off look-ahead]"
+permissions:
+  hematite.admin:
+    description: The action bar and /hematite
+    default: op
